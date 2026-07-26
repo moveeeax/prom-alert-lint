@@ -1,0 +1,36 @@
+groups:
+  - name: sloppy
+    rules:
+      # Missing `for`, missing severity label, missing annotations.
+      - alert: DiskFilling
+        expr: node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.1
+
+      # Unparseable PromQL (dangling operator).
+      - alert: BrokenQuery
+        expr: rate(http_requests_total[5m]) >
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "broken"
+          description: "broken expr"
+
+      # Trivial constant expression: always fires.
+      - alert: AlwaysOn
+        expr: 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "always"
+          description: "constant expression"
+
+      # Duplicate alert name (already defined above).
+      - alert: DiskFilling
+        expr: node_filesystem_avail_bytes < 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dup"
+          description: "duplicate alert name"

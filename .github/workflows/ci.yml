@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build & test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.22", "1.23"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Test (race)
+        run: go test -race -count=1 ./...
+
+      - name: Build
+        run: go build -o prom-alert-lint .
+
+      - name: Smoke - clean rules pass
+        run: |
+          set +e
+          ./prom-alert-lint lint examples/good.yml
+          code=$?
+          set -e
+          test "$code" -eq 0 || { echo "expected exit 0 on good.yml, got $code"; exit 1; }
+
+      - name: Smoke - bad rules fail
+        run: |
+          set +e
+          ./prom-alert-lint lint examples/bad.yml --format json
+          code=$?
+          set -e
+          test "$code" -eq 1 || { echo "expected exit 1 on bad.yml, got $code"; exit 1; }

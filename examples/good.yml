@@ -1,0 +1,29 @@
+groups:
+  - name: api-availability
+    rules:
+      - alert: ApiHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="api",code=~"5.."}[5m]))
+            / sum(rate(http_requests_total{job="api"}[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "API 5xx error rate is above 5%"
+          description: "The api job has served >5% 5xx responses for 10 minutes."
+
+      - alert: ApiHighLatency
+        expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job="api"}[5m])) by (le)) > 1
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "API p99 latency is above 1s"
+          description: "p99 latency for the api job has exceeded 1s for 15 minutes."
+
+  - name: recording
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))

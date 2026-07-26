@@ -1,0 +1,34 @@
+name: prom-alert-lint
+description: Lint Prometheus alerting rules for bad PromQL and missing for/labels/annotations
+branding:
+  icon: alert-triangle
+  color: orange
+
+inputs:
+  files:
+    description: Space-separated files or globs to lint (e.g. "rules/*.yml").
+    required: true
+  args:
+    description: Extra CLI flags, e.g. "--strict --require-label team".
+    required: false
+    default: ""
+  go-version:
+    description: Go toolchain version used to build the linter.
+    required: false
+    default: "1.23"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ inputs.go-version }}
+
+    - name: Build and run prom-alert-lint
+      shell: bash
+      run: |
+        bin="$RUNNER_TEMP/prom-alert-lint"
+        go build -o "$bin" "${{ github.action_path }}"
+        # shellcheck disable=SC2086
+        "$bin" lint ${{ inputs.files }} ${{ inputs.args }}

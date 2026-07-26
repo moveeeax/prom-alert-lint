@@ -1,0 +1,14 @@
+# Binaries
+/prom-alert-lint
+/dist/
+*.exe
+*.out
+
+# Go
+/vendor/
+coverage.out
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
