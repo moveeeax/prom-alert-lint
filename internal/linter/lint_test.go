@@ -381,3 +381,43 @@ groups:
 		}
 	}
 }
+
+// TestPrometheus3Syntax pins PromQL behavior of the Prometheus 3.x parser.
+// holt_winters was accepted by the 2.x parser; in 3.x it was renamed to the
+// experimental double_exponential_smoothing, which the default (stable)
+// parser rejects. Quoted UTF-8 metric and label names must keep parsing.
+func TestPrometheus3Syntax(t *testing.T) {
+	rule := func(expr string) string {
+		return `
+groups:
+  - name: g
+    rules:
+      - alert: A
+        expr: '` + expr + `'
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: s
+          description: d
+`
+	}
+	cases := []struct {
+		name    string
+		expr    string
+		invalid bool
+	}{
+		{"utf8 metric name", `{"http.server.requests", job="api"} > 0`, false},
+		{"utf8 label name", `up{"service.name"="api"} == 0`, false},
+		{"holt_winters removed", `holt_winters(up[10m], 0.5, 0.5) > 0`, true},
+		{"double_exponential_smoothing is experimental", `double_exponential_smoothing(up[10m], 0.5, 0.5) > 0`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			codes := lintCodes(t, DefaultConfig(), rule(tc.expr))
+			if got := has(codes, "error:invalid-promql"); got != tc.invalid {
+				t.Fatalf("invalid-promql = %v, want %v (codes %v)", got, tc.invalid, codes)
+			}
+		})
+	}
+}

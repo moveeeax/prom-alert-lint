@@ -10,6 +10,10 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 )
 
+// promqlParser validates rule expressions. It uses the default (stable) PromQL
+// feature set, matching a Prometheus server started without feature flags.
+var promqlParser = parser.NewParser(parser.Options{})
+
 // Level is the severity of a diagnostic.
 type Level string
 
@@ -164,7 +168,7 @@ func (l *Linter) checkRule(file string, g RuleGroup, r Rule) {
 	if r.Expr == "" {
 		emit("missing-expr", Error, "rule has no `expr`")
 	} else if kind == "alert" || l.cfg.CheckRecordExpr {
-		if expr, err := parser.ParseExpr(r.Expr); err != nil {
+		if expr, err := promqlParser.ParseExpr(r.Expr); err != nil {
 			emit("invalid-promql", Error, fmt.Sprintf("PromQL does not parse: %v", err))
 		} else if kind == "alert" && isTrivial(expr) {
 			emit("trivial-expr", Error, "alert expression is a constant and will always or never fire")
