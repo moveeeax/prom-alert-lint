@@ -2,9 +2,11 @@ package linter
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/promql/parser"
@@ -22,18 +24,58 @@ const (
 	Error Level = "error"
 	// Warning marks a soft issue; it fails the lint only with --strict.
 	Warning Level = "warning"
+	// Info marks a hint that is reported but never fails the lint.
+	Info Level = "info"
+	// Off drops a diagnostic entirely. It is only valid as an override.
+	Off Level = "off"
 )
 
+// Codes lists every diagnostic code the rule linter can emit, in the order
+// used by the README.
+var Codes = []string{
+	"invalid-promql", "trivial-expr", "missing-expr", "missing-for", "invalid-for",
+	"missing-label", "missing-annotation", "missing-runbook", "duplicate-alert",
+	"not-a-rule", "bad-severity", "bad-name", "parse-error", "read-error", "no-groups",
+}
+
+// ParseLevels parses repeated `code=level` overrides (level is error, warning,
+// info or off). Codes not in known are rejected so a typo does not silently
+// leave a check at its default level.
+func ParseLevels(specs []string, known []string) (map[string]Level, error) {
+	out := map[string]Level{}
+	for _, s := range specs {
+		code, lv, ok := strings.Cut(s, "=")
+		if !ok {
+			return nil, fmt.Errorf("level override %q: want code=error|warning|info|off", s)
+		}
+		code, lv = strings.TrimSpace(code), strings.TrimSpace(lv)
+		if !contains(known, code) {
+			return nil, fmt.Errorf("level override %q: unknown code %q", s, code)
+		}
+		switch Level(lv) {
+		case Error, Warning, Info, Off:
+			out[code] = Level(lv)
+		default:
+			return nil, fmt.Errorf("level override %q: unknown level %q (want error, warning, info or off)", s, lv)
+		}
+	}
+	return out, nil
+}
+
 // Diagnostic is a single finding tied to a file and, where possible, a rule.
+// Object is the "namespace/name" of the PrometheusRule the rule came from,
+// empty for plain rule files. Suggestion is an optional hint on how to fix it.
 type Diagnostic struct {
-	File    string `json:"file"`
-	Line    int    `json:"line,omitempty"`
-	Group   string `json:"group,omitempty"`
-	Rule    string `json:"rule,omitempty"`
-	Kind    string `json:"kind,omitempty"`
-	Code    string `json:"code"`
-	Level   Level  `json:"level"`
-	Message string `json:"message"`
+	File       string `json:"file"`
+	Line       int    `json:"line,omitempty"`
+	Object     string `json:"object,omitempty"`
+	Group      string `json:"group,omitempty"`
+	Rule       string `json:"rule,omitempty"`
+	Kind       string `json:"kind,omitempty"`
+	Code       string `json:"code"`
+	Level      Level  `json:"level"`
+	Message    string `json:"message"`
+	Suggestion string `json:"suggestion,omitempty"`
 }
 
 // Config controls which checks run and how strict they are.
@@ -51,7 +93,16 @@ type Config struct {
 	NamePattern *regexp.Regexp
 	// CheckRecordExpr also validates PromQL of recording rules.
 	CheckRecordExpr bool
-	// Strict makes warnings count towards a non-zero exit code.
+	// RequireRunbook flags alerts with neither a `runbook_url` nor a
+	// `runbook` annotation.
+	RequireRunbook bool
+	// SkipNonRules drops the no-groups warning for valid YAML that holds no
+	// rule groups, for globs over mixed config directories.
+	SkipNonRules bool
+	// Levels overrides the level of individual codes; Off drops the code.
+	Levels map[string]Level
+	// Strict makes warnings count towards a non-zero exit code. Info-level
+	// diagnostics never do.
 	Strict bool
 }
 
@@ -71,7 +122,7 @@ func DefaultConfig() Config {
 // names so duplicates across files are caught.
 type Linter struct {
 	cfg   Config
-	seen  map[string]string // alert name -> file:line first seen
+	seen  map[string]string // alert name + static labels -> file:line first seen
 	diags []Diagnostic
 	files int
 	rules int
@@ -97,6 +148,9 @@ func (l *Linter) Errors() int { return l.count(Error) }
 // Warnings counts warning-level diagnostics.
 func (l *Linter) Warnings() int { return l.count(Warning) }
 
+// Infos counts info-level diagnostics.
+func (l *Linter) Infos() int { return l.count(Info) }
+
 func (l *Linter) count(lv Level) int {
 	n := 0
 	for _, d := range l.diags {
@@ -108,7 +162,7 @@ func (l *Linter) count(lv Level) int {
 }
 
 // ExitCode is 0 when clean, 1 when there are errors (or warnings under
-// --strict).
+// --strict). Info-level diagnostics never affect it.
 func (l *Linter) ExitCode() int {
 	if l.Errors() > 0 || (l.cfg.Strict && l.Warnings() > 0) {
 		return 1
@@ -116,7 +170,16 @@ func (l *Linter) ExitCode() int {
 	return 0
 }
 
-func (l *Linter) add(d Diagnostic) { l.diags = append(l.diags, d) }
+// add records d after applying any level override for its code.
+func (l *Linter) add(d Diagnostic) {
+	if lv, ok := l.cfg.Levels[d.Code]; ok {
+		if lv == Off {
+			return
+		}
+		d.Level = lv
+	}
+	l.diags = append(l.diags, d)
+}
 
 // LintFile reads and lints a file by path.
 func (l *Linter) LintFile(path string) error {
@@ -129,49 +192,77 @@ func (l *Linter) LintFile(path string) error {
 	return nil
 }
 
-// LintBytes lints an in-memory rule file. name is used for diagnostics; it does
-// no I/O, which keeps the check set unit-testable without touching disk.
+// LintReader lints a rule stream such as stdin. name is used for diagnostics.
+func (l *Linter) LintReader(name string, r io.Reader) error {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		l.add(Diagnostic{File: name, Code: "read-error", Level: Error, Message: err.Error()})
+		return err
+	}
+	l.LintBytes(name, data)
+	return nil
+}
+
+// LintBytes lints an in-memory rule file, which may hold several YAML
+// documents and PrometheusRule manifests. name is used for diagnostics; it
+// does no I/O, which keeps the check set unit-testable without touching disk.
 func (l *Linter) LintBytes(name string, data []byte) {
 	l.files++
-	rf, err := ParseRuleFile(data)
+	docs, err := ParseDocuments(data)
 	if err != nil {
-		l.add(Diagnostic{File: name, Code: "parse-error", Level: Error, Message: err.Error()})
-		return
+		l.add(Diagnostic{File: name, Line: errLine(err), Code: "parse-error", Level: Error, Message: err.Error(),
+			Suggestion: "fix the YAML syntax; Prometheus will refuse to load this file"})
 	}
-	if len(rf.Groups) == 0 {
-		l.add(Diagnostic{File: name, Code: "no-groups", Level: Warning,
-			Message: "file contains no rule groups"})
-	}
-	for _, g := range rf.Groups {
-		for _, r := range g.Rules {
-			l.rules++
-			l.checkRule(name, g, r)
+	groups, objects := 0, 0
+	for _, doc := range docs {
+		if doc.Kind == DocOtherObject {
+			objects++
+			continue
 		}
+		if doc.Kind == DocPrometheusRule {
+			objects++
+		}
+		for _, g := range doc.Groups {
+			groups++
+			for _, r := range g.Rules {
+				l.rules++
+				l.checkRule(name, doc.Object, g, r)
+			}
+		}
+	}
+	// Kubernetes manifests without rules are expected in Helm output, so only
+	// plain YAML without groups draws the warning.
+	if err == nil && groups == 0 && objects == 0 && !l.cfg.SkipNonRules {
+		l.add(Diagnostic{File: name, Code: "no-groups", Level: Warning,
+			Message:    "file contains no rule groups",
+			Suggestion: "pass --skip-non-rules if this is not meant to be a rule file"})
 	}
 }
 
-func (l *Linter) checkRule(file string, g RuleGroup, r Rule) {
-	base := Diagnostic{File: file, Line: r.Line, Group: g.Name, Rule: r.Name(), Kind: r.Kind()}
-	emit := func(code string, lv Level, msg string) {
+func (l *Linter) checkRule(file, object string, g RuleGroup, r Rule) {
+	base := Diagnostic{File: file, Line: r.Line, Object: object, Group: g.Name, Rule: r.Name(), Kind: r.Kind()}
+	emit := func(code string, lv Level, msg, fix string) {
 		d := base
-		d.Code, d.Level, d.Message = code, lv, msg
+		d.Code, d.Level, d.Message, d.Suggestion = code, lv, msg, fix
 		l.add(d)
 	}
 
 	kind := r.Kind()
 	if kind == "" {
-		emit("not-a-rule", Error, "rule is neither an alerting rule (`alert`) nor a recording rule (`record`), or sets both")
+		emit("not-a-rule", Error, "rule is neither an alerting rule (`alert`) nor a recording rule (`record`), or sets both",
+			"set exactly one of `alert` or `record`")
 		return
 	}
 
 	// PromQL: must be present, parse, and (for alerts) be non-trivial.
 	if r.Expr == "" {
-		emit("missing-expr", Error, "rule has no `expr`")
+		emit("missing-expr", Error, "rule has no `expr`", "")
 	} else if kind == "alert" || l.cfg.CheckRecordExpr {
 		if expr, err := promqlParser.ParseExpr(r.Expr); err != nil {
-			emit("invalid-promql", Error, fmt.Sprintf("PromQL does not parse: %v", err))
+			emit("invalid-promql", Error, fmt.Sprintf("PromQL does not parse: %v", err), "")
 		} else if kind == "alert" && isTrivial(expr) {
-			emit("trivial-expr", Error, "alert expression is a constant and will always or never fire")
+			emit("trivial-expr", Error, "alert expression is a constant and will always or never fire",
+				"compare a metric against the threshold, e.g. `up == 0`; use `vector(1)` for a deliberate always-firing watchdog")
 		}
 	}
 
@@ -182,36 +273,66 @@ func (l *Linter) checkRule(file string, g RuleGroup, r Rule) {
 	// Alert-only hygiene checks.
 	if r.For == "" {
 		if l.cfg.RequireFor {
-			emit("missing-for", Error, "alert has no `for`; it fires on a single scrape")
+			emit("missing-for", Error, "alert has no `for`; it fires on a single scrape",
+				"add e.g. `for: 5m` so the condition must hold before firing")
 		}
 	} else if _, err := model.ParseDuration(r.For); err != nil {
-		emit("invalid-for", Error, fmt.Sprintf("`for: %s` is not a valid duration: %v", r.For, err))
+		emit("invalid-for", Error, fmt.Sprintf("`for: %s` is not a valid duration: %v", r.For, err),
+			"use a Prometheus duration such as `30s`, `5m` or `1h`")
 	}
 
 	for _, lbl := range l.cfg.RequiredLabels {
 		if r.Labels[lbl] == "" {
-			emit("missing-label", Error, fmt.Sprintf("required label %q is missing or empty", lbl))
+			fix := fmt.Sprintf("add `labels: { %s: ... }`", lbl)
+			if lbl == "severity" {
+				fix = "add `labels: { severity: warning }` (or critical/info)"
+			}
+			emit("missing-label", Error, fmt.Sprintf("required label %q is missing or empty", lbl), fix)
 		}
 	}
 	for _, an := range l.cfg.RequiredAnnotations {
 		if r.Annotations[an] == "" {
-			emit("missing-annotation", Error, fmt.Sprintf("required annotation %q is missing or empty", an))
+			emit("missing-annotation", Error, fmt.Sprintf("required annotation %q is missing or empty", an),
+				fmt.Sprintf("add `annotations: { %s: ... }`", an))
 		}
+	}
+	if l.cfg.RequireRunbook && r.Annotations["runbook_url"] == "" && r.Annotations["runbook"] == "" {
+		emit("missing-runbook", Error, "alert has no `runbook_url` (or `runbook`) annotation; responders have nothing to open",
+			"add `annotations: { runbook_url: https://... }`")
 	}
 
 	if sev := r.Labels["severity"]; sev != "" && len(l.cfg.SeverityValues) > 0 && !contains(l.cfg.SeverityValues, sev) {
-		emit("bad-severity", Warning, fmt.Sprintf("severity %q is not one of %v", sev, l.cfg.SeverityValues))
+		emit("bad-severity", Warning, fmt.Sprintf("severity %q is not one of %v", sev, l.cfg.SeverityValues), "")
 	}
 
 	if l.cfg.NamePattern != nil && !l.cfg.NamePattern.MatchString(r.Alert) {
-		emit("bad-name", Warning, fmt.Sprintf("alert name %q does not match %s", r.Alert, l.cfg.NamePattern))
+		emit("bad-name", Warning, fmt.Sprintf("alert name %q does not match %s", r.Alert, l.cfg.NamePattern), "")
 	}
 
-	if where, ok := l.seen[r.Alert]; ok {
-		emit("duplicate-alert", Error, fmt.Sprintf("alert name %q already defined at %s", r.Alert, where))
+	// The same name with different static labels is legal tiering (e.g. a
+	// warning and a critical variant), so the key includes the labels.
+	key := alertKey(r)
+	if where, ok := l.seen[key]; ok {
+		emit("duplicate-alert", Error, fmt.Sprintf("alert %q with the same labels already defined at %s", r.Alert, where),
+			"remove one copy, or give the variants different labels (e.g. severity)")
 	} else {
-		l.seen[r.Alert] = fmt.Sprintf("%s:%d", file, r.Line)
+		l.seen[key] = fmt.Sprintf("%s:%d", file, r.Line)
 	}
+}
+
+// alertKey identifies an alert by its name and static labels.
+func alertKey(r Rule) string {
+	names := make([]string, 0, len(r.Labels))
+	for k := range r.Labels {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	b.WriteString(r.Alert)
+	for _, k := range names {
+		fmt.Fprintf(&b, "\x00%s=%s", k, r.Labels[k])
+	}
+	return b.String()
 }
 
 // isTrivial reports whether an expression is a bare constant (number or string

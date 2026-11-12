@@ -12,6 +12,7 @@ type Summary struct {
 	Rules    int `json:"rules"`
 	Errors   int `json:"errors"`
 	Warnings int `json:"warnings"`
+	Infos    int `json:"infos"`
 }
 
 // Report is the JSON document emitted with --format json.
@@ -30,6 +31,7 @@ func (l *Linter) Report() Report {
 			Rules:    l.rules,
 			Errors:   l.Errors(),
 			Warnings: l.Warnings(),
+			Infos:    l.Infos(),
 		},
 		Diagnostics: ds,
 	}
@@ -42,8 +44,8 @@ func (l *Linter) WriteJSON(w io.Writer) error {
 	return enc.Encode(l.Report())
 }
 
-// WriteText emits a human-readable report and returns whether any diagnostics
-// were printed.
+// WriteText emits a human-readable report. A diagnostic with a suggestion gets
+// a second line, indented, starting with "fix:".
 func (l *Linter) WriteText(w io.Writer) {
 	rep := l.Report()
 	for _, d := range rep.Diagnostics {
@@ -55,13 +57,23 @@ func (l *Linter) WriteText(w io.Writer) {
 		if rule == "" {
 			rule = "-"
 		}
+		if d.Object != "" {
+			rule = d.Object + " " + rule
+		}
 		fmt.Fprintf(w, "%-7s %s  [%s] %s: %s\n", d.Level, loc, rule, d.Code, d.Message)
+		if d.Suggestion != "" {
+			fmt.Fprintf(w, "  fix: %s\n", d.Suggestion)
+		}
 	}
 	s := rep.Summary
-	if s.Errors == 0 && s.Warnings == 0 {
+	if s.Errors == 0 && s.Warnings == 0 && s.Infos == 0 {
 		fmt.Fprintf(w, "OK: %d rule(s) across %d file(s), no issues\n", s.Rules, s.Files)
 		return
 	}
-	fmt.Fprintf(w, "%d error(s), %d warning(s) in %d rule(s) across %d file(s)\n",
-		s.Errors, s.Warnings, s.Rules, s.Files)
+	if s.Errors == 0 && s.Warnings == 0 {
+		fmt.Fprintf(w, "OK: %d rule(s) across %d file(s), %d info\n", s.Rules, s.Files, s.Infos)
+		return
+	}
+	fmt.Fprintf(w, "%d error(s), %d warning(s), %d info in %d rule(s) across %d file(s)\n",
+		s.Errors, s.Warnings, s.Infos, s.Rules, s.Files)
 }
