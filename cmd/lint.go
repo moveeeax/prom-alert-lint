@@ -24,25 +24,39 @@ func newLintCmd() *cobra.Command {
 		namePattern string
 		strict      bool
 		recordExpr  bool
+		runbook     bool
+		skipNonRule bool
+		levels      []string
 	)
 
 	cmd := &cobra.Command{
-		Use:   "lint [flags] <file|glob>...",
-		Short: "Lint one or more Prometheus rule files",
+		Use:   "lint [flags] <file|glob|->...",
+		Short: "Lint Prometheus rule files and PrometheusRule manifests",
+		Long: "Lint Prometheus rule files. Files may hold several YAML documents; a\n" +
+			"`kind: PrometheusRule` object is linted through its spec.groups and other\n" +
+			"Kubernetes kinds are skipped. Pass - to read from stdin.",
 		Example: "  prom-alert-lint lint rules/*.yml --require-label severity\n" +
-			"  prom-alert-lint lint examples/bad.yml --format json",
+			"  prom-alert-lint lint examples/bad.yml --format json\n" +
+			"  helm template ./chart | prom-alert-lint lint -",
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if format != "text" && format != "json" {
 				return fmt.Errorf("unknown --format %q (want text or json)", format)
 			}
 
+			lv, err := linter.ParseLevels(levels, linter.Codes)
+			if err != nil {
+				return err
+			}
 			cfg := linter.Config{
 				RequireFor:          requireFor,
 				RequiredLabels:      reqLabels,
 				RequiredAnnotations: reqAnnots,
 				SeverityValues:      sevValues,
 				CheckRecordExpr:     recordExpr,
+				RequireRunbook:      runbook,
+				SkipNonRules:        skipNonRule,
+				Levels:              lv,
 				Strict:              strict,
 			}
 			if namePattern != "" {
@@ -63,6 +77,10 @@ func newLintCmd() *cobra.Command {
 
 			l := linter.New(cfg)
 			for _, p := range paths {
+				if p == "-" {
+					_ = l.LintReader("<stdin>", cmd.InOrStdin())
+					continue
+				}
 				_ = l.LintFile(p)
 			}
 
@@ -87,7 +105,10 @@ func newLintCmd() *cobra.Command {
 	f.StringArrayVar(&sevValues, "severity-value", nil, "allowed value for the severity label (repeatable); empty disables the check")
 	f.StringVar(&namePattern, "name-pattern", "", "regexp every alert name must match (empty disables the check)")
 	f.BoolVar(&recordExpr, "check-record-expr", true, "validate PromQL of recording rules too")
-	f.BoolVar(&strict, "strict", false, "treat warnings as failures (non-zero exit)")
+	f.BoolVar(&runbook, "require-runbook", false, "require a `runbook_url` or `runbook` annotation on every alert")
+	f.BoolVar(&skipNonRule, "skip-non-rules", false, "skip valid YAML without rule groups instead of warning no-groups")
+	f.StringArrayVar(&levels, "level", nil, "override a check's level: code=error|warning|info|off (repeatable)")
+	f.BoolVar(&strict, "strict", false, "treat warnings as failures (non-zero exit); info never fails")
 	return cmd
 }
 
@@ -104,6 +125,10 @@ func expandPaths(args []string) ([]string, error) {
 		}
 	}
 	for _, a := range args {
+		if a == "-" {
+			add(a)
+			continue
+		}
 		matches, err := filepath.Glob(a)
 		if err != nil {
 			return nil, fmt.Errorf("bad pattern %q: %w", a, err)

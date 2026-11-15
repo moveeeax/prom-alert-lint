@@ -25,9 +25,10 @@ groups:
           summary: "always"
           description: "constant expression"
 
-      # Duplicate alert name (already defined above).
-      - alert: DiskFilling
-        expr: node_filesystem_avail_bytes < 1000
+      # Duplicate: same name and labels as BrokenQuery above. (The same name
+      # with a different severity would be legal tiering.)
+      - alert: BrokenQuery
+        expr: rate(http_requests_total[5m]) > 100
         for: 5m
         labels:
           severity: warning

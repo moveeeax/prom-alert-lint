@@ -421,3 +421,261 @@ groups:
 		})
 	}
 }
+
+func TestDuplicateTieringIsAllowed(t *testing.T) {
+	const y = `
+groups:
+  - name: g
+    rules:
+      - alert: DiskFilling
+        expr: disk_free < 0.2
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: s, description: d}
+      - alert: DiskFilling
+        expr: disk_free < 0.1
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: s, description: d}
+`
+	if c := lintCodes(t, DefaultConfig(), y); has(c, "error:duplicate-alert") {
+		t.Fatalf("same name with different severity is tiering, not a duplicate: %v", c)
+	}
+}
+
+func TestRequireRunbook(t *testing.T) {
+	rule := func(annots string) string {
+		return `
+groups:
+  - name: g
+    rules:
+      - alert: A
+        expr: up == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: s, description: d` + annots + `}
+`
+	}
+	if c := lintCodes(t, DefaultConfig(), rule("")); has(c, "error:missing-runbook") {
+		t.Fatalf("missing-runbook must be off by default, got %v", c)
+	}
+	cfg := DefaultConfig()
+	cfg.RequireRunbook = true
+	if c := lintCodes(t, cfg, rule("")); !has(c, "error:missing-runbook") {
+		t.Fatalf("expected missing-runbook, got %v", c)
+	}
+	for _, a := range []string{", runbook_url: https://r/a", ", runbook: https://r/a"} {
+		if c := lintCodes(t, cfg, rule(a)); c != nil {
+			t.Fatalf("annotation %q should satisfy the check, got %v", a, c)
+		}
+	}
+}
+
+func TestLevelOverrides(t *testing.T) {
+	const y = `
+groups:
+  - name: g
+    rules:
+      - alert: A
+        expr: up == 0
+        for: 5m
+        labels: {severity: warning}
+`
+	lv, err := ParseLevels([]string{"missing-annotation=info", "missing-runbook=off"}, Codes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.RequireRunbook = true
+	cfg.Levels = lv
+	cfg.Strict = true
+	l := New(cfg)
+	l.LintBytes("t.yml", []byte(y))
+	if l.Infos() != 2 || l.Errors() != 0 || l.Warnings() != 0 {
+		t.Fatalf("want 2 info and nothing else, got %+v", l.Diagnostics())
+	}
+	if l.ExitCode() != 0 {
+		t.Fatalf("info must not fail even under strict, got exit %d", l.ExitCode())
+	}
+	var buf bytes.Buffer
+	l.WriteText(&buf)
+	if !strings.Contains(buf.String(), "OK: 1 rule(s) across 1 file(s), 2 info") {
+		t.Fatalf("unexpected summary:\n%s", buf.String())
+	}
+}
+
+func TestParseLevelsRejectsBadInput(t *testing.T) {
+	for _, s := range []string{"missing-for", "missing-for=fatal", "no-such-check=info"} {
+		if _, err := ParseLevels([]string{s}, Codes); err == nil {
+			t.Errorf("expected an error for %q", s)
+		}
+	}
+}
+
+func TestSuggestionInOutput(t *testing.T) {
+	const y = `
+groups:
+  - name: g
+    rules:
+      - alert: A
+        expr: up == 0
+        labels: {severity: warning}
+        annotations: {summary: s, description: d}
+`
+	l := New(DefaultConfig())
+	l.LintBytes("t.yml", []byte(y))
+	var text bytes.Buffer
+	l.WriteText(&text)
+	if !strings.Contains(text.String(), "\n  fix: add e.g. `for: 5m`") {
+		t.Fatalf("text output lacks the fix line:\n%s", text.String())
+	}
+	var js bytes.Buffer
+	if err := l.WriteJSON(&js); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(js.String(), `"suggestion": "add e.g.`) {
+		t.Fatalf("json output lacks the suggestion:\n%s", js.String())
+	}
+}
+
+func TestParseErrorLine(t *testing.T) {
+	l := New(DefaultConfig())
+	l.LintBytes("t.yml", []byte("groups:\n  - name: g\n    rules: [this is: not valid: mapping\n"))
+	ds := l.Diagnostics()
+	if len(ds) != 1 || ds[0].Code != "parse-error" {
+		t.Fatalf("want one parse-error, got %+v", ds)
+	}
+	// yaml.v3 reports this error against line 2; the diagnostic must carry
+	// the same line the parser names.
+	if ds[0].Line != 2 || !strings.Contains(ds[0].Message, "line 2:") {
+		t.Fatalf("parse-error line = %d, want 2 (%s)", ds[0].Line, ds[0].Message)
+	}
+}
+
+func TestSkipNonRules(t *testing.T) {
+	const y = "foo: bar\nbaz: [1, 2, 3]\n"
+	if c := lintCodes(t, DefaultConfig(), y); !has(c, "warning:no-groups") {
+		t.Fatalf("expected no-groups by default, got %v", c)
+	}
+	cfg := DefaultConfig()
+	cfg.SkipNonRules = true
+	if c := lintCodes(t, cfg, y); c != nil {
+		t.Fatalf("expected silence with SkipNonRules, got %v", c)
+	}
+}
+
+func TestMultiDocument(t *testing.T) {
+	const y = `groups:
+  - name: a
+    rules:
+      - alert: A
+        expr: up == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: s, description: d}
+---
+groups:
+  - name: b
+    rules:
+      - alert: B
+        expr: up == 0
+`
+	l := New(DefaultConfig())
+	l.LintBytes("multi.yml", []byte(y))
+	if l.Rules() != 2 {
+		t.Fatalf("want 2 rules across both documents, got %d", l.Rules())
+	}
+	for _, d := range l.Diagnostics() {
+		if d.Rule != "B" || d.Line != 13 {
+			t.Fatalf("diagnostic should point at B on line 13 of the stream, got %+v", d)
+		}
+	}
+}
+
+const promRuleManifests = `# Source: chart/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unrelated
+data:
+  groups: "not rules"
+---
+# Source: chart/templates/rules.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: api
+  namespace: monitoring
+spec:
+  groups:
+    - name: api
+      rules:
+        - alert: ApiDown
+          expr: up{job="api"} == 0
+          labels:
+            severity: critical
+          annotations:
+            summary: s
+            description: d
+---
+`
+
+func TestPrometheusRule(t *testing.T) {
+	l := New(DefaultConfig())
+	l.LintBytes("helm.yml", []byte(promRuleManifests))
+	ds := l.Diagnostics()
+	if l.Rules() != 1 || len(ds) != 1 {
+		t.Fatalf("want one rule with one diagnostic, got %d rules: %+v", l.Rules(), ds)
+	}
+	d := ds[0]
+	if d.Code != "missing-for" || d.Object != "monitoring/api" || d.Rule != "ApiDown" || d.Line != 19 {
+		t.Fatalf("unexpected diagnostic %+v", d)
+	}
+	var buf bytes.Buffer
+	l.WriteText(&buf)
+	if !strings.Contains(buf.String(), "helm.yml:19  [monitoring/api ApiDown] missing-for") {
+		t.Fatalf("text output should carry the object:\n%s", buf.String())
+	}
+}
+
+func TestKubernetesListAndOtherKinds(t *testing.T) {
+	const list = `apiVersion: v1
+kind: List
+items:
+  - apiVersion: monitoring.coreos.com/v1
+    kind: PrometheusRule
+    metadata: {name: r1}
+    spec:
+      groups:
+        - name: g
+          rules:
+            - alert: X
+              expr: up == 0
+              for: 5m
+              labels: {severity: warning}
+              annotations: {summary: s, description: d}
+  - apiVersion: v1
+    kind: Service
+    metadata: {name: svc}
+`
+	l := New(DefaultConfig())
+	l.LintBytes("list.yml", []byte(list))
+	if l.Rules() != 1 || len(l.Diagnostics()) != 0 {
+		t.Fatalf("want one clean rule from the List, got %d rules: %+v", l.Rules(), l.Diagnostics())
+	}
+
+	// Only non-rule Kubernetes objects: skipped without no-groups.
+	if c := lintCodes(t, DefaultConfig(), "apiVersion: v1\nkind: Service\nmetadata: {name: s}\n"); c != nil {
+		t.Fatalf("other kinds must be skipped silently, got %v", c)
+	}
+}
+
+func TestLintReader(t *testing.T) {
+	l := New(DefaultConfig())
+	if err := l.LintReader("<stdin>", strings.NewReader(promRuleManifests)); err != nil {
+		t.Fatal(err)
+	}
+	if l.Files() != 1 || l.Rules() != 1 || l.Diagnostics()[0].File != "<stdin>" {
+		t.Fatalf("unexpected result: files=%d rules=%d %+v", l.Files(), l.Rules(), l.Diagnostics())
+	}
+}

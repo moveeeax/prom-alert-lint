@@ -2,6 +2,8 @@
 package cmd
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 )
 
@@ -15,18 +17,21 @@ func newRootCmd() *cobra.Command {
 		Long: "prom-alert-lint parses Prometheus rule files and flags broken or sloppy\n" +
 			"alerting rules: unparseable or trivial PromQL, a missing `for`, missing\n" +
 			"severity labels, missing summary/description annotations and duplicate\n" +
-			"alert names. It exits non-zero on violations so it fits straight into CI.",
+			"alert names. It exits non-zero on violations so it fits straight into CI.\n\n" +
+			"The silences command audits live Alertmanager silences.",
 		Version:       version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	root.AddCommand(newLintCmd())
+	root.AddCommand(newLintCmd(), newSilencesCmd())
 	return root
 }
 
 // Execute runs the CLI and returns the process exit code.
 func Execute() int {
-	if err := newRootCmd().Execute(); err != nil {
+	root := newRootCmd()
+	if err := root.Execute(); err != nil {
+		fmt.Fprintln(root.ErrOrStderr(), "error:", err)
 		return 2
 	}
 	return exitCode
